@@ -20,6 +20,7 @@
 #include <SD.h>
 #include <stdlib.h>
 #include "utilities_debug.h"
+#include "count_occupancy_in_frame.h"
 
 
 static File g_videoFile;
@@ -57,6 +58,10 @@ char global_averageFrame_path[64] = {0};
 // index FW = start of row 2 (x=0,y=1), and so on.
 // Updated in place by AverageFrameCreate(); read via CameraGetAverageFrame().
 static uint8_t* g_avgFrame = nullptr;
+
+// Per-quadrant mean brightness of the average frame, computed in AverageFrameCreate().
+// Used by DivideFrameIntoGridAndDiff() to normalize diffs as percentage change.
+static uint32_t g_quadrantAvgBrightness[GRID_DIFF_NUM_QUADRANTS] = { 0 };
 
 static bool g_recording = false;
 static unsigned long g_recordingStartMs = 0;
@@ -181,8 +186,8 @@ Frame CameraGetCopyOfLatestFrame()
 
 void CameraRelease(const Frame& frame)
 {
-    if (frame.valid) {
-        esp_camera_fb_return((camera_fb_t*)frame.copyOfbufferInMemory);
+    if (frame.valid && frame.copyOfbufferInMemory) {
+        free(frame.copyOfbufferInMemory);
     }
 }
 
@@ -213,6 +218,10 @@ bool CameraSaveSnapToSD(const char* path)
 
 const uint8_t* CameraGetAverageFrame() {
     return g_avgFrame;
+}
+
+const uint32_t* CameraGetQuadrantAvgBrightness() {
+    return g_quadrantAvgBrightness;
 }
 
 
@@ -279,6 +288,32 @@ bool AverageFrameCreate(int numSecondsToAverage) {
     }
 
     turnOffLED();
+
+    // Compute per-quadrant average brightness from the finished average frame.
+    // Used later in DivideFrameIntoGridAndDiff() to normalize diffs as percentage change
+    // instead of absolute change — so a dark corner and a bright window area are treated fairly.
+    const uint16_t QUAD_W = FW / GRID_DIFF_NUM_COLS;
+    const uint16_t QUAD_H = FH / GRID_DIFF_NUM_ROWS;
+    uint64_t quadrantSum[GRID_DIFF_NUM_QUADRANTS] = { 0 };
+    uint32_t quadrantPixCount[GRID_DIFF_NUM_QUADRANTS] = { 0 };
+
+    for (size_t i = 0; i < NPIX; i++) {
+        const uint16_t x   = i % FW;
+        const uint16_t y   = i / FW;
+        const uint8_t col  = min((uint8_t)(x / QUAD_W), (uint8_t)(GRID_DIFF_NUM_COLS - 1));
+        const uint8_t row  = min((uint8_t)(y / QUAD_H), (uint8_t)(GRID_DIFF_NUM_ROWS - 1));
+        const uint8_t q    = row * GRID_DIFF_NUM_COLS + col;
+        quadrantSum[q]     += g_avgFrame[i];
+        quadrantPixCount[q]++;
+    }
+
+    for (uint8_t q = 0; q < GRID_DIFF_NUM_QUADRANTS; q++) {
+        if (quadrantPixCount[q] > 0) {
+            g_quadrantAvgBrightness[q] = (uint32_t)(quadrantSum[q] / quadrantPixCount[q]);
+        } else {
+            g_quadrantAvgBrightness[q] = 1;
+        }
+    }
 
     // Save average frame to SD card for debugging/visualization
     uint8_t* jpgBuf = nullptr;
